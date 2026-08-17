@@ -1,0 +1,94 @@
+name: Build, Deploy and Expose GoPhish via Cloudflare
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:   # 允许手动触发
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 检出 GoPhish 源码（官方仓库或你自己的 fork）
+      - name: Checkout GoPhish source
+        uses: actions/checkout@v4
+        with:
+          repository: gophish/gophish   # 可替换为你自己的 fork
+          ref: master
+
+      # 2. 安装 Go 环境
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      # 3. 编译 GoPhish（生成 Linux amd64 二进制）
+      - name: Build GoPhish
+        run: |
+          GOOS=linux GOARCH=amd64 go build -o gophish
+
+      # 4. 通过 SCP 上传二进制及配置文件到服务器
+      - name: Upload binaries to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}   # 通常是 root 或 ubuntu
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "gophish,config.json"          # 确保 config.json 已在仓库根目录
+          target: "/opt/gophish"                 # 服务器上的部署目录
+
+      # 5. 通过 SSH 在服务器上执行重启 & Cloudflare Tunnel 启动
+      - name: Restart GoPhish and ensure Cloudflare Tunnel
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: horse1.cn.mt
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            # 进入部署目录
+            cd /opt/gophish
+            chmod +x gophish
+
+            # 停止旧服务（假设已有 systemd 服务）
+            systemctl stop gophish || true
+
+            # 启动新服务（可改为 nohup 直接运行）
+            systemctl start gophish
+
+            # ---- Cloudflare Tunnel 部分 ----
+            # 安装 cloudflared（若未安装）
+            if ! command -v cloudflared &> /dev/null; then
+              curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+              chmod +x /usr/local/bin/cloudflared
+            fi
+
+            # 创建隧道（首次运行）
+            cloudflared tunnel create gophish-tunnel || true
+
+            # 运行隧道，将本地 3333 端口（管理面板）暴露到 Cloudflare 边缘
+            # 建议使用 systemd 或 screen 持久运行，这里仅作演示
+            nohup cloudflared tunnel --url http://localhost:3333 run gophish-tunnel > /var/log/cloudflared.log 2>&1 &
+
+      # 6.（可选）更新 Cloudflare DNS 记录，将域名指向服务器公网 IP
+      - name: Update DNS record (if needed)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          DOMAIN: horse1.cn.mt
+        run: |
+          # 获取服务器公网 IP（从 GitHub Actions 环境获取，或通过 API）
+          IP=$(curl -s https://api.ipify.org)
+          # 获取 DNS 记录 ID（需先手动获取或使用 jq 解析）
+          RECORD_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records?type=A&name=$DOMAIN" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json" | jq -r '.result[0].id')
+          # 更新记录
+          curl -X PUT "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records/$RECORD_ID" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "{\"type\":\"A\",\"name\":\"$DOMAIN\",\"content\":\"$IP\",\"ttl\":120,\"proxied\":true}"
